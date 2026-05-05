@@ -1,26 +1,18 @@
-# _erised had pruned TM, in _firebolt starting to add growth metrics
+# _horcrux - added bubble charts
 
-## choose noise value -done
+# To dos
 
-# use different labels in chart -  2nd change is to  make it possible to choose different labels on the icicle/treemap charts. Currently it uses the columns used to build it. We should also add the option to show them in hover. For that we need the analogy of my label_converter I think.
-# finally done - it's possible to choose the 2nd set of columns as names but GUI is messy and need to remove debugging stuff later
-
-# To fix first:
-
-# 1 -  add preview!!!! done
-# 2 - fix UI: make it clear what the selectors do, remove debugging stuff
-
-# TM (and icicle) filtering! done
-
-### coloring!!!!! and otehr metrics...
-
-# bubble charts with enrichment
-# timeline
+# 1 - fix UI: make it clear what the selectors do, remove debugging stuff
+# timeline plots -- scatter
+# other growth metrics 
+# geographical map
+# maybe add option to remove -1 / unclustered cluster from the bubble charts
+# DEFINITELY add the bubble chart in exports!!!
+# in bubble chart, don't hardcode citations on x axis. First, datasets nor from Clarivate will have columns with different names; 2nd, what if we want to use something else? Maybe let the user choose another numerical metric? Think about this
+# keywords....!
+# retractions?
 
 
-# other metrics - slope, CAGR etc
-
-# otehr charts, enrichment etc
 
 import numpy as np
 import io
@@ -58,6 +50,178 @@ def load_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
 # Pattern: <base>_eps<eps>  e.g. 5D_nn12_mins3_MSC48_eps0.13
 # ============================================================
 
+def build_cluster_id_to_label_map(
+    df: pd.DataFrame,
+    id_col: str,
+    label_col: str,
+    noise_values=("-1", "-1.0", "-1", None, "", "nan", "NaN", "None")
+) -> dict:
+    """
+    Build mapping: cluster_id (string) -> descriptive label (string), using mode (most frequent).
+    """
+    noise_set = set(str(x) for x in noise_values if x is not None)
+
+    tmp = df[[id_col, label_col]].copy()
+    tmp[id_col] = tmp[id_col].astype("string")
+    tmp[label_col] = tmp[label_col].astype("string")
+
+    # drop noise and missing labels
+    tmp = tmp[~tmp[id_col].isin(list(noise_set))]
+    tmp = tmp.dropna(subset=[id_col, label_col])
+
+    if len(tmp) == 0:
+        return {}
+
+    # mode label per cluster id
+    def _mode(s: pd.Series) -> str:
+        vc = s.value_counts(dropna=True)
+        return vc.index[0] if len(vc) else ""
+
+    mapping = tmp.groupby(id_col)[label_col].apply(_mode).to_dict()
+    return mapping
+
+def _to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
+
+def _year_series(df: pd.DataFrame, year_col: str) -> pd.Series:
+    y = pd.to_numeric(df[year_col], errors="coerce")
+    return y.dropna().astype(int)
+
+def _compute_enrichment_table_for_year(
+    df: pd.DataFrame,
+    cluster_col: str,
+    year_col: str,
+    year_val: int,
+    citations_col: str,
+    citations_agg: str,   # "mean" or "median"
+    enrich_dim: str,      # "Journal" | "Document Type" | "Open Access" | "Funder contains"
+    enrich_value: str,
+    enrich_method: str,   # "Fold (share ratio)" | "Share difference (pp)" | "Raw share"
+    min_cluster_size: int = 20,
+    journal_col: str = "Source Title",
+    doc_type_col: str = "Document Type",
+    oa_col: str = "Open Access Designations",
+    funder_col: str = "Funding Name Preferred",
+) -> pd.DataFrame:
+    """
+    Returns per-cluster metrics for a single year:
+      cluster, N_total, citations_stat, N_target, share_target, baseline_share, enrichment
+    """
+    d = df.copy()
+    d["_YEAR_"] = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+    d = d[d["_YEAR_"] == year_val].copy()
+    if len(d) == 0:
+        return pd.DataFrame(columns=[
+            "cluster", "N_total", "citations", "N_target",
+            "share_target", "baseline_share", "enrichment"
+        ])
+
+    # cluster labels as string
+    d["_CL_"] = d[cluster_col].astype("string")
+
+    # total citations
+    d["_CIT_"] = pd.to_numeric(d[citations_col], errors="coerce")
+
+    # choose target mask based on enrichment dimension
+    enrich_dim = (enrich_dim or "").strip()
+    if enrich_dim == "Journal":
+        tgt = (d[journal_col].astype("string") == str(enrich_value))
+    elif enrich_dim == "Document Type":
+        tgt = (d[doc_type_col].astype("string") == str(enrich_value))
+    elif enrich_dim == "Open Access":
+        tgt = (d[oa_col].astype("string") == str(enrich_value))
+    elif enrich_dim == "Funder contains":
+        # contains match, case-insensitive
+        pat = (enrich_value or "").strip()
+        if pat == "":
+            tgt = pd.Series([False] * len(d), index=d.index)
+        else:
+            tgt = d[funder_col].astype("string").str.contains(pat, case=False, na=False)
+    else:
+        tgt = pd.Series([False] * len(d), index=d.index)
+
+    # aggregate per cluster
+    g = d.groupby("_CL_", dropna=False)
+
+    N_total = g.size().rename("N_total")
+
+    if citations_agg == "median":
+        cit = g["_CIT_"].median().rename("citations")
+    else:
+        cit = g["_CIT_"].mean().rename("citations")
+
+    N_target = d[tgt].groupby("_CL_", dropna=False).size().rename("N_target")
+
+    out = pd.concat([N_total, cit, N_target], axis=1).fillna({"N_target": 0})
+    out["N_target"] = out["N_target"].astype(int)
+
+    # filter clusters by size
+    out = out[out["N_total"] >= int(min_cluster_size)].copy()
+
+    # baseline share for the year
+    N_all = int(len(d))
+    N_target_all = int(tgt.sum())
+    baseline_share = (N_target_all / N_all) if N_all > 0 else 0.0
+
+    out["share_target"] = out["N_target"] / out["N_total"]
+    out["baseline_share"] = baseline_share
+
+    # enrichment metric
+    if enrich_method == "Raw share":
+        out["enrichment"] = out["share_target"]
+    elif enrich_method == "Share difference (pp)":
+        out["enrichment"] = 100.0 * (out["share_target"] - baseline_share)
+    else:
+        # Fold enrichment (share ratio)
+        # if baseline_share==0 -> undefined; set NaN
+        out["enrichment"] = np.where(
+            baseline_share > 0,
+            out["share_target"] / baseline_share,
+            np.nan
+        )
+
+    out = out.reset_index().rename(columns={"_CL_": "cluster"})
+    out["year"] = int(year_val)
+    return out
+
+
+def make_bubble_fig(df_year: pd.DataFrame, title: str, colorbar_title: str):
+    """
+    df_year columns expected: cluster, citations, N_total, enrichment
+    """
+    if df_year is None or len(df_year) == 0:
+        return None
+
+    # sort clusters so y-axis is stable and informative (by citations then size)
+    dfp = df_year.sort_values(["citations", "N_total"], ascending=[True, True]).copy()
+
+    fig = px.scatter(
+        dfp,
+        x="citations",
+        #y="cluster",
+        y="cluster_label",
+        size="N_total",
+        color="enrichment",
+        size_max=60,
+        hover_data={
+            "year": True,
+            "N_total": True,
+            "N_target": True,
+            "share_target": ":.3f",
+            "baseline_share": ":.3f",
+            "enrichment": ":.3f",
+            "citations": ":.2f",
+        },
+        title=title,
+    )
+    fig.update_layout(
+        height=900,
+        yaxis_title="Cluster",
+        xaxis_title="Citations",
+        coloraxis_colorbar=dict(title=colorbar_title),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
 
 
 def _safe_to_int_year(s: pd.Series) -> pd.Series:
@@ -674,9 +838,9 @@ hover_cols = st.sidebar.multiselect(
 # ============================================================
 tabs = st.tabs([
     "📈 Scatter",
-    "🧬 Hierarchy (Sankey + edges)",
-    "🧊 Icicle (soon)",
-    "🧭 Placeholder",
+    "🧬 Useless mess (Sankey + edges)",
+    "🌳 Hierarchical viz and growth metrics: Icicle and Treemap plots",
+    "📊 Enrichment charts",
     "📄 Uploaded file preview",
     "⬇ Exports",
 ])
@@ -1039,6 +1203,12 @@ with tabs[2]:
     #    value=True
     #)
 
+    st.info(
+    "Note: ℹ️The selected year range is used exactly as shown (inclusive). "
+    "⚠️If the most recent year is incomplete in your dataset, growth metrics may look lower/unstable—"
+    "consider ending the range at the last fully covered year."
+            )
+
     metric_mode = st.radio(
         "Growth method",
         options=["Slope (linear)", "CAGR"],
@@ -1182,7 +1352,211 @@ with tabs[2]:
 # Tab 3: Placeholder
 # ============================================================
 with tabs[3]:
-    st.subheader("Placeholder")
+    st.subheader("📌 Bubble chart: Citations × Topic × Enrichment (by year)")
+    st.caption("Bubble size = number of papers in the cluster (selected year). X = citations. Color = enrichment of selected attribute vs baseline in that year.")
+
+    # -----------------------------
+    # Required columns selection
+    # -----------------------------
+    # Year column
+    year_default = "Publication Year" if "Publication Year" in df.columns else df.columns.tolist()[0]
+    year_col = st.selectbox(
+        "Publication year column",
+        options=df.columns.tolist(),
+        index=df.columns.tolist().index(year_default),
+    )
+
+    # Candidate cluster columns: anything with "_eps" (Scout outputs)
+    eps_candidates = [c for c in df.columns if "_eps" in c.lower()]
+    if not eps_candidates:
+        st.warning("No *_eps* cluster columns found in this file.")
+        st.stop()
+
+#############################################################################################################################
+    cluster_col = st.selectbox(
+        "Cluster assignment column (choose one eps level)",
+        options=eps_candidates,
+        index=0,
+        help="Select one clustering level (e.g., labels_..._eps0.21)."
+    )
+#######################################################
+    # ---- Cluster label (descriptive) column selector ----
+    # Offer columns with the same eps suffix as the chosen cluster column
+    eps_suffix = None
+    m = re.search(r"_eps\d+(?:\.\d+)?$", cluster_col, flags=re.IGNORECASE)
+    if m:
+        eps_suffix = m.group(0)  # e.g. "_eps0.21"
+
+    label_options = ["(same as ID)"]
+    if eps_suffix:
+        same_eps_cols = [c for c in df.columns if str(c).endswith(eps_suffix) and c != cluster_col]
+        # keep only those that look like descriptive candidates (optional heuristic)
+        label_options += same_eps_cols
+    else:
+        # fallback: allow any column (user can pick) if suffix not found
+        label_options += [c for c in df.columns if c != cluster_col]
+
+    label_col_choice = st.selectbox(
+        "Cluster label column (descriptive)",
+        options=label_options,
+        index=0,
+        help="Pick the descriptive column for the SAME eps level as the cluster ID column (e.g., ctfidf/BERTopic descriptions)."
+    )
+
+######################################################
+    # Citations column
+    cit_candidates = [c for c in df.columns if "times cited" in c.lower() or "citation" in c.lower()]
+    if not cit_candidates:
+        cit_candidates = df.columns.tolist()
+
+    cit_default = None
+    for pref in ["Times Cited, WoS Core", "Times Cited, All Databases"]:
+        if pref in df.columns:
+            cit_default = pref
+            break
+    if cit_default is None:
+        cit_default = cit_candidates[0]
+
+    citations_col = st.selectbox(
+        "Citations column",
+        options=cit_candidates,
+        index=cit_candidates.index(cit_default) if cit_default in cit_candidates else 0,
+    )
+
+    citations_agg = st.radio(
+        "Citations aggregation for x-axis",
+        options=["mean", "median"],
+        index=0,
+        horizontal=True
+    )
+
+    # -----------------------------
+    # Year slider
+    # -----------------------------
+    yrs = pd.to_numeric(df[year_col], errors="coerce").dropna()
+    if len(yrs) < 2:
+        st.warning("Not enough valid years found to build the chart.")
+        st.stop()
+
+    y_min, y_max = int(yrs.min()), int(yrs.max())
+    year_val = st.slider("Year", min_value=y_min, max_value=y_max, value=y_max, step=1)
+
+    # -----------------------------
+    # Cluster shortlist filter
+    # -----------------------------
+    min_cluster_size = st.number_input(
+        "Show only clusters with at least N papers in the selected year",
+        min_value=1,
+        max_value=5000,
+        value=20,
+        step=1
+    )
+
+    # -----------------------------
+    # Enrichment controls
+    # -----------------------------
+    enrich_dim = st.selectbox(
+        "Enrichment dimension",
+        options=["Journal", "Document Type", "Open Access", "Funder contains"],
+        index=0
+    )
+
+    # value widget changes depending on dimension
+    if enrich_dim == "Journal":
+        col = "Source Title"
+        if col not in df.columns:
+            st.warning("Column 'Source Title' not found for Journal enrichment.")
+            st.stop()
+        top = df[col].astype("string").value_counts(dropna=True).head(200).index.tolist()
+        enrich_value = st.selectbox("Journal of interest (JOI)", options=top)
+        legend_title = enrich_value
+
+    elif enrich_dim == "Document Type":
+        col = "Document Type"
+        if col not in df.columns:
+            st.warning("Column 'Document Type' not found.")
+            st.stop()
+        opts = sorted(df[col].astype("string").dropna().unique().tolist())
+        enrich_value = st.selectbox("Target document type", options=opts)
+        legend_title = enrich_value
+
+    elif enrich_dim == "Open Access":
+        col = "Open Access Designations"
+        if col not in df.columns:
+            st.warning("Column 'Open Access Designations' not found.")
+            st.stop()
+        opts = sorted(df[col].astype("string").dropna().unique().tolist())
+        enrich_value = st.selectbox("Target OA category", options=opts)
+        legend_title = enrich_value
+
+    else:  # Funder contains
+        enrich_value = st.text_input("Funder contains (case-insensitive)", value="")
+        legend_title = enrich_value if enrich_value else "Funder match"
+
+    enrich_method = st.selectbox(
+        "Enrichment metric",
+        options=["Fold (share ratio)", "Share difference (pp)", "Raw share"],
+        index=0,
+        help="Fold = (share in cluster) / (share overall in that year)."
+    )
+
+    st.info(
+        "Enrichment is computed per year. Fold-enrichment > 1 means the selected attribute is overrepresented "
+        "in that cluster compared to its baseline share in the same year."
+    )
+
+    # -----------------------------
+    # Compute table + plot
+    # -----------------------------
+    bubble_df = _compute_enrichment_table_for_year(
+        df=df,
+        cluster_col=cluster_col,
+        year_col=year_col,
+        year_val=year_val,
+        citations_col=citations_col,
+        citations_agg=citations_agg,
+        enrich_dim=enrich_dim,
+        enrich_value=enrich_value,
+        enrich_method=enrich_method,
+        min_cluster_size=int(min_cluster_size),
+    )
+########################################
+# ---- Apply descriptive labels for y-axis ----
+    bubble_df = bubble_df.copy()
+    bubble_df["cluster_id"] = bubble_df["cluster"]  # keep original ID for hover
+
+    if label_col_choice != "(same as ID)":
+        id_to_label = build_cluster_id_to_label_map(
+            df=df,
+            id_col=cluster_col,
+            label_col=label_col_choice,
+            noise_values=noise_values_user if "noise_values_user" in globals() else ("-1", "-1.0", "-1", None, "", "nan", "NaN", "None")
+        )
+        bubble_df["cluster_label"] = bubble_df["cluster"].map(id_to_label).fillna(bubble_df["cluster"])
+    else:
+        bubble_df["cluster_label"] = bubble_df["cluster"]
+
+
+##################################################
+    title = f"{citations_agg.capitalize()} citations by cluster in {year_val} — colored by enrichment of {enrich_dim}: {legend_title}"
+    colorbar_title = f"{enrich_method} ({legend_title})"
+
+    fig = make_bubble_fig(bubble_df, title=title, colorbar_title=colorbar_title)
+
+    if fig is None:
+        st.warning("No clusters passed the filters for this year.")
+    else:
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("Show computed table for this year"):
+            st.dataframe(bubble_df, use_container_width=True)
+
+        st.download_button(
+            "⬇ Download table (CSV)",
+            data=bubble_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"bubble_enrichment_{year_val}.csv",
+            mime="text/csv"
+        )
 
 
 with tabs[4]:
