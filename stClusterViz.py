@@ -1,5 +1,4 @@
-# starting repo with _dragon version from May 4th, 2026
-# fixing messed up broomstick
+# _erised had pruned TM, in _firebolt starting to add growth metrics
 
 ## choose noise value -done
 
@@ -8,10 +7,13 @@
 
 # To fix first:
 
-# 1 -  add preview!!!!
-# 2 - fix UI: make it clear what the seletors do, remove debugging stuff
+# 1 -  add preview!!!! done
+# 2 - fix UI: make it clear what the selectors do, remove debugging stuff
 
-# TM (and icicle) filtering!
+# TM (and icicle) filtering! done
+
+### coloring!!!!! and otehr metrics...
+
 # bubble charts with enrichment
 # timeline
 
@@ -20,8 +22,9 @@
 
 # otehr charts, enrichment etc
 
-
+import numpy as np
 import io
+import zipfile
 #from platform import node
 import re
 from collections import defaultdict
@@ -54,6 +57,228 @@ def load_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
 # Helpers: Scout-style eps column detection
 # Pattern: <base>_eps<eps>  e.g. 5D_nn12_mins3_MSC48_eps0.13
 # ============================================================
+
+
+
+def _safe_to_int_year(s: pd.Series) -> pd.Series:
+    """Convert a year column to int where possible; invalid -> NA."""
+    y = pd.to_numeric(s, errors="coerce")
+    return y.astype("Int64")
+
+def compute_growth_metrics_for_nodes(
+    df_wide: pd.DataFrame,
+    eps_cols_id: list[str],
+    eps_values_id: list[float],
+    year_col: str,
+    noise_values=(" -1", "-1", "-1.0", None, "", "nan", "NaN", "None"),
+    start_year: int | None = None,
+    end_year: int | None = None,
+    exclude_last_year: bool = False, # bool = True,
+    cagr_smoothing: float = 0.0,   # 0.0 = strict; 1.0 = Laplace smoothing
+) -> pd.DataFrame:
+    """
+    Returns a dataframe:
+        node_id, slope, cagr, n_total, n_start, n_end, years_start, years_end
+    where node_id matches df_for_plot node naming: f"{cluster}__eps{eps}"
+    """
+    if year_col not in df_wide.columns:
+        raise ValueError(f"Year column not found: {year_col}")
+
+    # Clean years
+    years = _safe_to_int_year(df_wide[year_col])
+    tmp = df_wide.copy()
+    tmp["_PUBYEAR_"] = years
+    tmp = tmp.dropna(subset=["_PUBYEAR_"])
+    tmp["_PUBYEAR_"] = tmp["_PUBYEAR_"].astype(int)
+
+    # Restrict year window
+    if start_year is not None:
+        tmp = tmp[tmp["_PUBYEAR_"] >= int(start_year)]
+    if end_year is not None:
+        tmp = tmp[tmp["_PUBYEAR_"] <= int(end_year)]
+
+    # Optionally exclude last year (often incomplete)
+    if exclude_last_year and len(tmp) > 0:
+        maxy = int(tmp["_PUBYEAR_"].max())
+        tmp = tmp[tmp["_PUBYEAR_"] < maxy]
+
+    if len(tmp) == 0:
+        # Return empty metrics df with correct columns
+        return pd.DataFrame(columns=[
+            "node_id", "slope", "cagr",
+            "n_total", "n_start", "n_end",
+            "year_start", "year_end"
+        ])
+
+    # Build metrics per eps level
+    results = []
+
+    noise_set = set(str(x) for x in noise_values)
+
+    # Precompute unique sorted years after filtering
+    year_list = sorted(tmp["_PUBYEAR_"].unique().tolist())
+    if len(year_list) < 2:
+        # Not enough points for growth
+        return pd.DataFrame(columns=[
+            "node_id", "slope", "cagr",
+            "n_total", "n_start", "n_end",
+            "year_start", "year_end"
+        ])
+
+    y = np.array(year_list, dtype=float)
+
+    for eps, col in zip(eps_values_id, eps_cols_id):
+        if col not in tmp.columns:
+            continue
+
+        # Use string labels consistently
+        s = tmp[[col, "_PUBYEAR_"]].copy()
+        s[col] = s[col].astype("string")
+
+        # Drop noise values
+        s = s[~s[col].isin(list(noise_set))].dropna(subset=[col])
+
+        if len(s) == 0:
+            continue
+
+        # counts per (cluster, year)
+        ct = (
+            s.groupby([col, "_PUBYEAR_"])
+             .size()
+             .unstack(fill_value=0)
+        )
+
+        # Ensure all years exist as columns
+        for yy in year_list:
+            if yy not in ct.columns:
+                ct[yy] = 0
+        ct = ct[year_list]
+
+        # Compute metrics per cluster in this eps column
+        for cluster_id, row in ct.iterrows():
+            N = row.values.astype(float)
+            if N.sum() == 0:
+                continue
+
+            # slope via polyfit (linear)
+            # If all zeros except one point, slope still defined but weak; keep it.
+            slope = float(np.polyfit(y, N, 1)[0])
+
+            # CAGR
+            n0 = float(N[0] + cagr_smoothing)
+            n1 = float(N[-1] + cagr_smoothing)
+            periods = len(N) - 1
+            if n0 <= 0:
+                cagr = np.nan
+            else:
+                cagr = float((n1 / n0) ** (1 / periods) - 1)
+
+            node_id = f"{str(cluster_id)}__eps{eps}"
+
+            results.append({
+                "node_id": node_id,
+                "slope": slope,
+                "cagr": cagr,
+                "n_total": float(N.sum()),
+                "n_start": float(N[0]),
+                "n_end": float(N[-1]),
+                "year_start": int(year_list[0]),
+                "year_end": int(year_list[-1]),
+                "eps": float(eps),
+                "cluster_id": str(cluster_id),
+                "source_col": col,
+            })
+
+    return pd.DataFrame(results)
+
+
+def attach_growth_to_df_for_plot(df_for_plot: pd.DataFrame, metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds columns to df_for_plot:
+      child_slope, child_cagr (+ parent_* if you want)
+    """
+    out = df_for_plot.copy()
+
+    if metrics_df is None or len(metrics_df) == 0:
+        out["child_slope"] = np.nan
+        out["child_cagr"] = np.nan
+        out["parent_slope"] = np.nan
+        out["parent_cagr"] = np.nan
+        return out
+
+    m = metrics_df[["node_id", "slope", "cagr"]].drop_duplicates("node_id")
+
+    # child metrics
+    out = out.merge(m, how="left", left_on="child", right_on="node_id")
+    out = out.rename(columns={"slope": "child_slope", "cagr": "child_cagr"}).drop(columns=["node_id"])
+
+    # parent metrics (optional but useful for hover)
+    out = out.merge(m, how="left", left_on="parent", right_on="node_id")
+    out = out.rename(columns={"slope": "parent_slope", "cagr": "parent_cagr"}).drop(columns=["node_id"])
+
+    return out
+
+from collections import defaultdict
+
+def prune_redundant_levels(df_edges: pd.DataFrame,
+                           parent_col: str = "parent",
+                           child_col: str = "child",
+                           size_col: str = "child size") -> pd.DataFrame:
+    """
+    Remove redundant 'no-change' nodes where child size == parent size and
+    the entire subtree below the child is also redundant (bottom-up).
+    Expects an edge list df with columns: parent, child, child size.
+    Returns a filtered copy (rows dropped).
+    """
+    df = df_edges.copy()
+
+    # Build adjacency + size map
+    tree = defaultdict(list)
+    for _, row in df.iterrows():
+        tree[row[parent_col]].append(row[child_col])
+
+    size_map = dict(zip(df[child_col], df[size_col]))
+
+    redundant_idx = set()
+
+    def is_redundant(node):
+        children = tree.get(node, [])
+        if not children:
+            return True
+        for ch in children:
+            if size_map.get(ch) != size_map.get(node) or not is_redundant(ch):
+                return False
+        return True
+
+    for idx, row in df.iterrows():
+        node = row[child_col]
+        parent = row[parent_col]
+        if size_map.get(node) == size_map.get(parent) and is_redundant(node):
+            redundant_idx.add(idx)
+
+    return df.drop(index=redundant_idx).reset_index(drop=True)
+
+def build_outputs_zip(df_for_plot, charts: dict):
+    """
+    charts: dict[str, bytes]
+        e.g. {"sankey.html": html_bytes, "treemap.html": html_bytes}
+    """
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        # dataframe
+        z.writestr(
+            "df_for_plot.csv",
+            df_for_plot.to_csv(index=False)
+        )
+
+        # charts
+        for name, content in charts.items():
+            z.writestr(name, content)
+
+    buffer.seek(0)
+    return buffer
+
 EPS_COL_RX = re.compile(r"^(?P<base>.+)_eps(?P<eps>\d+(?:\.\d+)?)$", flags=re.IGNORECASE)
 
 
@@ -452,6 +677,7 @@ tabs = st.tabs([
     "🧬 Hierarchy (Sankey + edges)",
     "🧊 Icicle (soon)",
     "🧭 Placeholder",
+    "📄 Uploaded file preview",
     "⬇ Exports",
 ])
 
@@ -776,17 +1002,94 @@ with tabs[2]:
         disp = mp.get(numeric, numeric)
         return f"{disp}{suffix}"
 
+    ######************************************************
+    # -----------------------------
+    # Growth metric controls
+    # -----------------------------
+    st.markdown("### Growth metric (for coloring)")
+
+    # Pick the year column
+    year_candidates = [c for c in df.columns if "year" in c.lower()]
+    default_year = "Publication Year" if "Publication Year" in df.columns else (year_candidates[0] if year_candidates else df.columns[0])
+
+    year_col = st.selectbox(
+        "Publication year column",
+        options=df.columns.tolist(),
+        index=df.columns.tolist().index(default_year),
+        help="Used to compute cluster growth over time."
+    )
+
+    # Convert to numeric years to set slider bounds
+    _years = pd.to_numeric(df[year_col], errors="coerce").dropna()
+    if len(_years) >= 2:
+        y_min, y_max = int(_years.min()), int(_years.max())
+    else:
+        y_min, y_max = 2020, 2025  # fallback
+
+    year_range = st.slider(
+        "Year range used for growth calculation",
+        min_value=y_min,
+        max_value=y_max,
+        value=(max(y_min, y_max-4), y_max),  # default: last ~5 years
+        step=1
+    )
+
+    #exclude_last_year = st.checkbox(
+    #    "Exclude last year (often incomplete)",
+    #    value=True
+    #)
+
+    metric_mode = st.radio(
+        "Growth method",
+        options=["Slope (linear)", "CAGR"],
+        index=0,
+        horizontal=True
+    )
+
+    cagr_smoothing = 0.0
+    if metric_mode == "CAGR":
+        cagr_smoothing = st.number_input(
+            "CAGR smoothing (add to counts; 0 = strict)",
+            min_value=0.0,
+            max_value=10.0,
+            value=0.0,
+            step=0.5,
+            help="Helps avoid undefined CAGR when the first year count is 0. Leave 0 unless you need it."
+        )
+
+    # -----------------------------
+    # Compute metrics per node and attach to df_for_plot
+    # -----------------------------
+    metrics_df = compute_growth_metrics_for_nodes(
+        df_wide=df,
+        eps_cols_id=eps_cols_id,
+        eps_values_id=eps_values_id,
+        year_col=year_col,
+        noise_values=noise_values_user,
+        start_year=year_range[0],
+        end_year=year_range[1],
+        exclude_last_year= False, #exclude_last_year,
+        cagr_smoothing=cagr_smoothing
+    )
+
+    df_for_plot = attach_growth_to_df_for_plot(df_for_plot, metrics_df)
+
+    # Choose column used for coloring
+    color_col = "child_slope" if metric_mode == "Slope (linear)" else "child_cagr"
+    color_title = f"{metric_mode} ({year_range[0]}–{year_range[1]})"
 
 
-    sample = df_for_plot.loc[df_for_plot["child"].str.contains(r"^6__eps0\.25$", na=False), "child"].iloc[0]
-    st.write("DEBUG sample repr / mapped:", repr(sample), "=>", to_display(sample))
+    ####    ***********************************************
+
+    #sample = df_for_plot.loc[df_for_plot["child"].str.contains(r"^6__eps0\.25$", na=False), "child"].iloc[0]
+    #st.write("DEBUG sample repr / mapped:", repr(sample), "=>", to_display(sample))
 
     # Create display columns used by Plotly
     df_for_plot["child_name"] = df_for_plot["child"].apply(to_display)
     st.write(df_for_plot.loc[df_for_plot["child"]=="6__eps0.25", ["child", "child_name"]].head(1))
 
-    st.write("Example:", df_for_plot.loc[df_for_plot["child"].str.contains("eps0.25", na=False), ["child", "child_name"]].head(3))
-    st.write("repr(child) sample:", repr(df_for_plot.loc[df_for_plot["child"].str.contains("eps0.25", na=False), "child"].iloc[0]))
+    #st.write("Example:", df_for_plot.loc[df_for_plot["child"].str.contains("eps0.25", na=False), ["child", "child_name"]].head(3))
+    #st.write("repr(child) sample:", repr(df_for_plot.loc[df_for_plot["child"].str.contains("eps0.25", na=False), "child"].iloc[0]))
 
 
     df_for_plot["parent_name"] = df_for_plot["parent"].apply(to_display)
@@ -799,25 +1102,77 @@ with tabs[2]:
             names="child_name",
             parents="parent_name",
             values="child size",
+            color=color_col,
+            color_continuous_scale="Spectral_r",
             title=f"{base_id} (display: {base_disp}) — Icicle",
-            hover_data={"child": True, "parent": True, "child size": True},
+            hover_data={"child": True, "parent": True, "child size": True, "child_slope": True, "child_cagr": True},
         )
         fig_i.update_traces(branchvalues="total")
-        fig_i.update_layout(height=850)
+        fig_i.update_layout(
+            height=850,
+            coloraxis_colorbar=dict(title=color_title),
+        )
         st.plotly_chart(fig_i, use_container_width=True)
 
+
+    
+    ################new tabB
     with tabB:
+        prune_tm = st.checkbox(
+            "Prune redundant levels (recommended)",
+            value=True,
+            key="prune_tm"
+        )
+
+        # 1) Start from the unpruned df_for_plot
+        df_for_tm = df_for_plot
+
+        # 2) Prune redundant levels (your helper)
+        if prune_tm:
+            df_for_tm = prune_redundant_levels(df_for_tm)
+
+        # 3) Ensure ROOT row exists for *this* dataframe (important for branchvalues='total')
+        #    (First remove any existing explicit ROOT row to avoid duplicates)
+        df_for_tm = df_for_tm[
+            ~((df_for_tm["child"] == ROOT_LABEL) & (df_for_tm["parent"] == ""))
+        ].copy()
+
+        # Re-add explicit root node row
+        # root_total should equal the sum of sizes of ROOT's direct children
+        if (df_for_tm["parent"] == ROOT_LABEL).any():
+            root_total = int(df_for_tm.loc[df_for_tm["parent"] == ROOT_LABEL, "child size"].sum())
+        else:
+            # fallback: if for some reason ROOT edges are missing, avoid crashing
+            root_total = int(df_for_tm["child size"].max())
+
+        df_for_tm = pd.concat(
+            [pd.DataFrame([{"parent": "", "child": ROOT_LABEL, "child size": root_total}]), df_for_tm],
+            ignore_index=True
+        )
+
+        # 4) Build display columns for *this* dataframe (so names match pruning)
+        df_for_tm["child_name"] = df_for_tm["child"].apply(to_display)
+        df_for_tm["parent_name"] = df_for_tm["parent"].apply(to_display)
+
+        # 5) Plot treemap using the pruned dataframe
         fig_t = px.treemap(
-            df_for_plot,
+            df_for_tm,
             names="child_name",
             parents="parent_name",
             values="child size",
+            color=color_col,
+            color_continuous_scale="Spectral_r",
             title=f"{base_id} (display: {base_disp}) — Treemap",
-            hover_data={"child": True, "parent": True, "child size": True},
+            hover_data={"child": True, "parent": True, "child size": True, "child_slope": True, "child_cagr": True},
         )
         fig_t.update_traces(branchvalues="total")
-        fig_t.update_layout(height=850)
+        fig_t.update_layout(
+            height=850,
+            coloraxis_colorbar=dict(title=color_title),
+        )
         st.plotly_chart(fig_t, use_container_width=True)
+    
+    
 
     with st.expander("Show df_for_plot"):  #("Show df_for_plot (head)")
         #st.dataframe(df_for_plot.head(50), use_container_width=True)
@@ -830,9 +1185,42 @@ with tabs[3]:
     st.subheader("Placeholder")
 
 
-# ============================================================
-# Tab 4: Exports
-# ============================================================
 with tabs[4]:
+    st.subheader("Uploaded file preview")
+
+    st.caption(
+        f"Rows: {len(df):,} · Columns: {len(df.columns):,}"
+    )
+
+    st.dataframe(
+        df.head(100),
+        use_container_width=True
+    )
+
+    with st.expander("Column names"):
+        st.write(list(df.columns))
+
+# ============================================================
+# Tab 5: Exports
+# ============================================================
+with tabs[5]:
     st.subheader("Exports")
-    st.caption("Export features will be added later.")
+
+    icicle_html = fig_i.to_html(full_html=True).encode("utf-8")
+
+    if st.button("📦 Save all outputs (ZIP)"):
+        zip_buffer = build_outputs_zip(
+            df_for_plot=df_for_plot,
+            charts={
+                #"sankey.html": sankey_html,
+                "icicle.html": icicle_html,
+                #"treemap.html": treemap_html,
+            }
+        )
+
+        st.download_button(
+            label="⬇️ Download ZIP",
+            data=zip_buffer,
+            file_name="stClusterViz_outputs.zip",
+            mime="application/zip",
+        )
