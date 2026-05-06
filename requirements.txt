@@ -1,0 +1,12 @@
+# Core app (security floor you mentioned)
+streamlit>=1.43.2,<2.0
+
+# Data handling
+pandas>=2.0
+numpy>=1.24
+
+# Interactive charts
+plotly>=5.20
+
+# XLSX reading (used explicitly in pd.read_excel(..., engine="openpyxl"))
+openpyxl>=3.1
